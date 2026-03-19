@@ -6,8 +6,8 @@ import type { WebSocket, RawData } from 'ws'
 import { Value } from '@sinclair/typebox/value'
 import type { PluginDef } from './plugin'
 import type { MethodDef } from './method'
-import { schemaFor, schemaMap, hashOf } from './schema'
-import type { PlexusStreamItem, StreamMetadata, PluginSchema } from './types'
+import { schemaMap } from './schema'
+import type { PlexusStreamItem, StreamMetadata } from './types'
 
 export type { WebSocket } from 'ws'
 
