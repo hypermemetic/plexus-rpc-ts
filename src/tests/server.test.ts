@@ -44,8 +44,8 @@ const testPlugin = plugin('echo', {
 
 let srv: PlexusServer
 
-beforeAll(() => {
-  srv = serve('echo', { port: 47001 }, testPlugin)
+beforeAll(async () => {
+  srv = await serve('echo', { port: 47001 }, testPlugin)
 })
 
 afterAll(() => {
@@ -159,10 +159,37 @@ async function call(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('server', () => {
-  test('_info returns backend name', async () => {
+  test('_info via echo.call returns backend name', async () => {
     const ws = await connect()
-    const resp = await sendRpc(ws, 1, '_info', {})
-    expect((resp.result as { backend: string }).backend).toBe('echo')
+    const { items } = await call(ws, 1, '_info', {})
+    expect(items.length).toBe(1)
+    expect((items[0] as { backend: string }).backend).toBe('echo')
+    ws.close()
+  })
+
+  test('_info direct (Haskell protocol) uses subscription and returns backend name', async () => {
+    const ws = await connect()
+    // Haskell client sends { method: '_info' } directly, expects subscription ACK + stream items
+    const { items } = await new Promise<{ items: unknown[] }>((resolve) => {
+      let subId: number | null = null
+      const items: unknown[] = []
+      const handler = (e: MessageEvent) => {
+        const msg = JSON.parse(e.data as string)
+        if (msg.id === 99 && msg.result !== undefined && typeof msg.result === 'number') {
+          subId = msg.result as number
+          return
+        }
+        if (msg.method === 'subscription' && subId !== null && msg.params.subscription === subId) {
+          const result = msg.params.result as { type: string; content?: unknown }
+          if (result.type === 'data') items.push(result.content)
+          if (result.type === 'done') { ws.removeEventListener('message', handler); resolve({ items }) }
+        }
+      }
+      ws.addEventListener('message', handler)
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: 99, method: '_info', params: null }))
+    })
+    expect(items.length).toBe(1)
+    expect((items[0] as { backend: string }).backend).toBe('echo')
     ws.close()
   })
 
@@ -201,6 +228,42 @@ describe('server', () => {
     const ws = await connect()
     const { items } = await call(ws, 1, 'echo.stream', { count: 3 })
     expect(items).toEqual([{ n: 0 }, { n: 1 }, { n: 2 }])
+    ws.close()
+  })
+
+  test('wire format — data items use snake_case keys', async () => {
+    const ws = await connect()
+
+    // Capture the first raw subscription notification
+    const rawResult = await new Promise<Record<string, unknown>>((resolve) => {
+      let subId: number | null = null
+      const handler = (e: MessageEvent) => {
+        const msg = JSON.parse(e.data as string)
+        if (msg.id === 1 && msg.result !== undefined) {
+          subId = msg.result as number
+          return
+        }
+        if (msg.method === 'subscription' && subId !== null && msg.params.subscription === subId) {
+          const result = msg.params.result as Record<string, unknown>
+          if (result['type'] === 'data') {
+            ws.removeEventListener('message', handler)
+            resolve(result)
+          }
+        }
+      }
+      ws.addEventListener('message', handler)
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'echo.call', params: { method: 'echo.ping', params: {} } }))
+    })
+
+    expect(typeof rawResult['content_type']).toBe('string')
+    expect((rawResult['content_type'] as string).length).toBeGreaterThan(0)
+    expect(rawResult['contentType']).toBeUndefined()
+
+    const meta = rawResult['metadata'] as Record<string, unknown>
+    expect(typeof meta['plexus_hash']).toBe('string')
+    expect((meta['plexus_hash'] as string).length).toBeGreaterThan(0)
+    expect(meta['plexusHash']).toBeUndefined()
+
     ws.close()
   })
 

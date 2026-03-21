@@ -39,5 +39,5 @@ const echoPlugin = plugin('echo', {
   },
 })
 
-const server = serve('echo', { port: 4445 }, echoPlugin)
+const server = await serve('echo', { port: 4445 }, echoPlugin)
 console.log(`echo server ready — connect plexus-gamma to ws://127.0.0.1:${server.port}`)

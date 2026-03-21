@@ -1,9 +1,15 @@
 import { randomUUID } from 'crypto'
+import { createServer } from 'http'
+import type { IncomingMessage } from 'http'
+import { WebSocketServer } from 'ws'
+import type { WebSocket, RawData } from 'ws'
 import { Value } from '@sinclair/typebox/value'
 import type { PluginDef } from './plugin'
 import type { MethodDef } from './method'
 import { schemaFor, schemaMap, hashOf } from './schema'
 import type { PlexusStreamItem, StreamMetadata, PluginSchema } from './types'
+
+export type { WebSocket } from 'ws'
 
 // ── Public API types ──────────────────────────────────────────────────────────
 
@@ -11,14 +17,15 @@ export interface ServeOptions {
   port?: number
   hostname?: string
   /** Called for every incoming HTTP upgrade before plexus-rpc handles it.
-   *  Call upgrade(tag) to accept; return true if handled, false to let the server handle it. */
-  onUpgrade?: (req: Request, upgrade: (tag: unknown) => boolean) => boolean
+   *  Receives the request pathname (e.g. '/bridge'). Call upgrade(tag) to accept;
+   *  return true if handled, false to let the server handle it as a plexus-rpc client. */
+  onUpgrade?: (pathname: string, upgrade: (tag: unknown) => boolean) => boolean
   /** Called when a custom-upgraded WebSocket opens. tag is whatever was passed to upgrade(). */
-  onCustomOpen?: (ws: import('bun').ServerWebSocket<unknown>, tag: unknown) => void
+  onCustomOpen?: (ws: WebSocket, tag: unknown) => void
   /** Called when a custom WebSocket receives a message. */
-  onCustomMessage?: (ws: import('bun').ServerWebSocket<unknown>, raw: string | Buffer, tag: unknown) => void
+  onCustomMessage?: (ws: WebSocket, raw: string | Buffer, tag: unknown) => void
   /** Called when a custom WebSocket closes. */
-  onCustomClose?: (ws: import('bun').ServerWebSocket<unknown>, tag: unknown) => void
+  onCustomClose?: (ws: WebSocket, tag: unknown) => void
 }
 
 export interface PlexusServer {
@@ -27,17 +34,35 @@ export interface PlexusServer {
   stop(): void
 }
 
-// ── Internal types ────────────────────────────────────────────────────────────
+// ── Wire serialization ────────────────────────────────────────────────────────
+// TypeScript interfaces use camelCase internally; the wire format uses snake_case
+// to match the Haskell/Rust deserialization. Only 'data' and 'error' items carry
+// fields that differ (content_type, plexus_hash); others pass through as-is.
 
-type WsData = { role: 'client'; id: string } | { role: 'custom'; tag: unknown }
+function toWireItem(item: PlexusStreamItem): unknown {
+  if (item.type === 'request') return item  // no metadata field
+  const meta = {
+    provenance: item.metadata.provenance,
+    plexus_hash: item.metadata.plexusHash,
+    timestamp: item.metadata.timestamp,
+  }
+  if (item.type === 'data')
+    return { type: 'data', metadata: meta, content_type: item.contentType, content: item.content }
+  if (item.type === 'error')
+    return { type: 'error', metadata: meta, message: item.message, recoverable: item.recoverable }
+  if (item.type === 'progress')
+    return { type: 'progress', metadata: meta, message: item.message, percentage: item.percentage }
+  // done
+  return { type: 'done', metadata: meta }
+}
 
 // ── serve() ───────────────────────────────────────────────────────────────────
 
-export function serve(
+export async function serve(
   name: string,
   options: ServeOptions,
   ...plugins: PluginDef[]
-): PlexusServer {
+): Promise<PlexusServer> {
   const port     = options.port     ?? 4444
   const hostname = options.hostname ?? '0.0.0.0'
 
@@ -65,26 +90,26 @@ export function serve(
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   function meta(): StreamMetadata {
-    return { provenance: [name], plexusHash: rootHash, timestamp: Date.now() / 1000 }
+    return { provenance: [name], plexusHash: rootHash, timestamp: Math.floor(Date.now() / 1000) }
   }
 
-  function sendNotif(ws: import('bun').ServerWebSocket<WsData>, subId: number, item: PlexusStreamItem) {
+  function sendNotif(ws: WebSocket, subId: number, item: PlexusStreamItem) {
     ws.send(JSON.stringify({
       jsonrpc: '2.0',
       method: 'subscription',
-      params: { subscription: subId, result: item },
+      params: { subscription: subId, result: toWireItem(item) },
     }))
   }
 
-  function sendData(ws: import('bun').ServerWebSocket<WsData>, subId: number, content: unknown, contentType = `${name}.result`) {
+  function sendData(ws: WebSocket, subId: number, content: unknown, contentType = `${name}.result`) {
     sendNotif(ws, subId, { type: 'data', metadata: meta(), contentType, content })
   }
 
-  function sendDone(ws: import('bun').ServerWebSocket<WsData>, subId: number) {
+  function sendDone(ws: WebSocket, subId: number) {
     sendNotif(ws, subId, { type: 'done', metadata: meta() })
   }
 
-  function sendError(ws: import('bun').ServerWebSocket<WsData>, subId: number, message: string) {
+  function sendError(ws: WebSocket, subId: number, message: string) {
     sendNotif(ws, subId, { type: 'error', metadata: meta(), message, recoverable: false })
     sendDone(ws, subId)
   }
@@ -92,15 +117,16 @@ export function serve(
   // ── Inner method dispatch ──────────────────────────────────────────────────
 
   async function handleInner(
-    ws: import('bun').ServerWebSocket<WsData>,
+    ws: WebSocket,
     subId: number,
     innerMethod: string,
     innerParams: unknown,
   ) {
     // Schema introspection: {ns}.schema
+    // Synapse sends relative paths (e.g. "ui.schema"), schemas map uses full paths ("plexus-gamma.ui")
     if (innerMethod.endsWith('.schema')) {
       const ns = innerMethod.slice(0, -7)
-      const schema = schemas.get(ns)
+      const schema = schemas.get(ns) ?? schemas.get(`${name}.${ns}`)
       if (schema) { sendData(ws, subId, schema, `${name}.schema`); sendDone(ws, subId); return }
       sendError(ws, subId, `Unknown namespace: ${ns}`); return
     }
@@ -108,7 +134,7 @@ export function serve(
     // Hash introspection: {ns}.hash
     if (innerMethod.endsWith('.hash')) {
       const ns = innerMethod.slice(0, -5)
-      const schema = schemas.get(ns)
+      const schema = schemas.get(ns) ?? schemas.get(`${name}.${ns}`)
       if (schema) { sendData(ws, subId, { event: 'hash', value: schema.hash }, `${name}.hash`); sendDone(ws, subId); return }
       sendError(ws, subId, `Unknown namespace: ${ns}`); return
     }
@@ -122,7 +148,8 @@ export function serve(
     }
 
     // Method call
-    const methodDef = methods.get(innerMethod)
+    // Synapse sends relative paths (e.g. "ui.navigate"), method map uses full paths ("plexus-gamma.ui.navigate")
+    const methodDef = methods.get(innerMethod) ?? methods.get(`${name}.${innerMethod}`)
     if (!methodDef) { sendError(ws, subId, `Method not found: ${innerMethod}`); return }
 
     // Apply TypeBox defaults then validate
@@ -161,100 +188,104 @@ export function serve(
     }
   }
 
-  // ── Bun server ─────────────────────────────────────────────────────────────
+  // ── HTTP + WebSocket servers ────────────────────────────────────────────────
 
   let nextSubId = 1
-  const clientSockets = new Map<string, import('bun').ServerWebSocket<WsData>>()
+  const clientSockets = new Map<string, WebSocket>()
 
-  const bunServer = Bun.serve<WsData>({
-    port,
-    hostname,
-
-    fetch(req, srv) {
-      // Custom upgrade hook (e.g. for bridge connections)
-      if (options.onUpgrade) {
-        const handled = options.onUpgrade(req, (data) => srv.upgrade(req, { data: { role: 'custom', tag: data } }))
-        if (handled) return undefined
-      }
-      // Default: upgrade every WebSocket connection as a client
-      const id = randomUUID()
-      const ok = srv.upgrade(req, { data: { role: 'client', id } as WsData })
-      if (ok) return undefined
-      return new Response(`${name} plexus-rpc server`, { status: 200 })
-    },
-
-    websocket: {
-      open(ws) {
-        const d = ws.data
-        if (d.role === 'custom') {
-          options.onCustomOpen?.(ws as import('bun').ServerWebSocket<unknown>, d.tag)
-          return
-        }
-        if (d.role === 'client') {
-          clientSockets.set(d.id, ws)
-          console.log(`[plexus-rpc] ${name}: client connected`)
-        }
-      },
-
-      message(ws, raw) {
-        const d = ws.data
-        if (d.role === 'custom') {
-          options.onCustomMessage?.(ws as import('bun').ServerWebSocket<unknown>, raw, d.tag)
-          return
-        }
-
-        const text = typeof raw === 'string' ? raw : raw.toString()
-        let msg: { jsonrpc: string; id: number; method: string; params?: unknown }
-        try { msg = JSON.parse(text) } catch { return }
-
-        if (d.role !== 'client') return
-
-        // Direct _info (no subscription)
-        if (msg.method === '_info') {
-          const rootSchema = schemas.get(name)
-          ws.send(JSON.stringify({
-            jsonrpc: '2.0', id: msg.id,
-            result: { backend: name, version: rootSchema?.version ?? '0.1.0' },
-          }))
-          return
-        }
-
-        // {name}.call — subscription pattern
-        if (msg.method === `${name}.call`) {
-          const p = msg.params as { method: string; params?: unknown }
-          const subId = nextSubId++
-          ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: subId }))
-          void handleInner(ws, subId, p.method, p.params ?? {})
-          return
-        }
-
-        // Unknown
-        ws.send(JSON.stringify({
-          jsonrpc: '2.0', id: msg.id,
-          error: { code: -32601, message: 'Method not found' },
-        }))
-      },
-
-      close(ws) {
-        const d = ws.data
-        if (d.role === 'custom') {
-          options.onCustomClose?.(ws as import('bun').ServerWebSocket<unknown>, d.tag)
-          return
-        }
-        if (d.role === 'client') {
-          clientSockets.delete(d.id)
-          console.log(`[plexus-rpc] ${name}: client disconnected`)
-        }
-      },
-    },
+  const httpServer = createServer((_req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' })
+    res.end(`${name} plexus-rpc server`)
   })
 
-  console.log(`[plexus-rpc] ${name} listening on :${bunServer.port}`)
+  const wss       = new WebSocketServer({ noServer: true })
+  const customWss = new WebSocketServer({ noServer: true })
+
+  httpServer.on('upgrade', (req: IncomingMessage, socket, head) => {
+    const pathname = (req.url ?? '/').split('?')[0]!
+
+    if (options.onUpgrade) {
+      const handled = options.onUpgrade(pathname, (tag: unknown) => {
+        customWss.handleUpgrade(req, socket as import('net').Socket, head, (ws) => {
+          customWss.emit('connection', ws, req, tag)
+        })
+        return true
+      })
+      if (handled) return
+    }
+
+    wss.handleUpgrade(req, socket as import('net').Socket, head, (ws) => {
+      wss.emit('connection', ws, req)
+    })
+  })
+
+  wss.on('connection', (ws: WebSocket) => {
+    const id = randomUUID()
+    clientSockets.set(id, ws)
+    console.log(`[plexus-rpc] ${name}: client connected`)
+
+    ws.on('message', (raw: RawData) => {
+      const text = typeof raw === 'string' ? raw : raw.toString()
+      let msg: { jsonrpc: string; id: number; method: string; params?: unknown }
+      try { msg = JSON.parse(text) } catch { return }
+
+      // _info — subscription protocol (Haskell client uses substrateRpc for all calls)
+      if (msg.method === '_info') {
+        const subId = nextSubId++
+        ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: subId }))
+        void handleInner(ws, subId, '_info', {})
+        return
+      }
+
+      // {name}.call — subscription pattern
+      if (msg.method === `${name}.call`) {
+        const p = msg.params as { method: string; params?: unknown }
+        const subId = nextSubId++
+        ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: subId }))
+        void handleInner(ws, subId, p.method, p.params ?? {})
+        return
+      }
+
+      // Unknown
+      ws.send(JSON.stringify({
+        jsonrpc: '2.0', id: msg.id,
+        error: { code: -32601, message: 'Method not found' },
+      }))
+    })
+
+    ws.on('close', () => {
+      clientSockets.delete(id)
+      console.log(`[plexus-rpc] ${name}: client disconnected`)
+    })
+  })
+
+  customWss.on('connection', (ws: WebSocket, _req: IncomingMessage, tag: unknown) => {
+    options.onCustomOpen?.(ws, tag)
+    ws.on('message', (raw: RawData) => {
+      options.onCustomMessage?.(ws, raw as string | Buffer, tag)
+    })
+    ws.on('close', () => {
+      options.onCustomClose?.(ws, tag)
+    })
+  })
+
+  // Wait for the server to start listening before returning
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once('error', reject)
+    httpServer.listen(port, hostname, resolve)
+  })
+
+  const boundPort = (httpServer.address() as import('net').AddressInfo).port
+  console.log(`[plexus-rpc] ${name} listening on :${boundPort}`)
 
   return {
-    port: bunServer.port as number,
+    port: boundPort,
     hostname,
-    stop() { bunServer.stop() },
+    stop() {
+      wss.close()
+      customWss.close()
+      httpServer.close()
+    },
   }
 }
 
