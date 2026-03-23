@@ -1,6 +1,8 @@
 {
   "name": "@plexus/rpc",
   "version": "0.1.0",
+  "description": "TypeScript/Bun implementation of Plexus RPC protocol with streaming, auto-validation, and zero-config debug endpoints",
+  "keywords": ["plexus", "rpc", "websocket", "jsonrpc", "typescript", "bun", "streaming", "schema-driven"],
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
