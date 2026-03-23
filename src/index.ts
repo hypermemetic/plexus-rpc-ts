@@ -8,3 +8,5 @@ export { serve } from './server'
 export type { ServeOptions, PlexusServer } from './server'
 
 export { schemaFor, hashOf, schemaMap } from './schema'
+
+export { debugPlugin, isDebugEnabled } from './debug'

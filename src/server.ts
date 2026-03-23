@@ -4,6 +4,7 @@ import type { PluginDef } from './plugin'
 import type { MethodDef } from './method'
 import { schemaFor, schemaMap, hashOf } from './schema'
 import type { PlexusStreamItem, StreamMetadata, PluginSchema } from './types'
+import { debugPlugin, isDebugEnabled } from './debug'
 
 // ── Public API types ──────────────────────────────────────────────────────────
 
@@ -57,6 +58,16 @@ export function serve(
     }
   }
 
+  // Auto-inject debug plugin if PLEXUS_DEBUG is enabled
+  // Add it to the root plugin's children AFTER root is constructed
+  if (isDebugEnabled()) {
+    rootPlugin = {
+      ...rootPlugin,
+      children: [...rootPlugin.children, debugPlugin]
+    }
+    console.log(`[plexus-rpc] PLEXUS_DEBUG enabled - debug endpoints available at _debug.*`)
+  }
+
   // Pre-build flat maps
   const schemas  = schemaMap(rootPlugin)
   const methods  = buildMethodMap(rootPlugin, [])
@@ -65,7 +76,7 @@ export function serve(
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   function meta(): StreamMetadata {
-    return { provenance: [name], plexusHash: rootHash, timestamp: Date.now() / 1000 }
+    return { provenance: [name], plexus_hash: rootHash, timestamp: Date.now() }
   }
 
   function sendNotif(ws: import('bun').ServerWebSocket<WsData>, subId: number, item: PlexusStreamItem) {
@@ -76,8 +87,8 @@ export function serve(
     }))
   }
 
-  function sendData(ws: import('bun').ServerWebSocket<WsData>, subId: number, content: unknown, contentType = `${name}.result`) {
-    sendNotif(ws, subId, { type: 'data', metadata: meta(), contentType, content })
+  function sendData(ws: import('bun').ServerWebSocket<WsData>, subId: number, content: unknown, content_type = `${name}.result`) {
+    sendNotif(ws, subId, { type: 'data', metadata: meta(), content_type, content })
   }
 
   function sendDone(ws: import('bun').ServerWebSocket<WsData>, subId: number) {
@@ -100,7 +111,8 @@ export function serve(
     // Schema introspection: {ns}.schema
     if (innerMethod.endsWith('.schema')) {
       const ns = innerMethod.slice(0, -7)
-      const schema = schemas.get(ns)
+      // Try both the requested namespace and with backend prefix
+      const schema = schemas.get(ns) ?? schemas.get(`${name}.${ns}`)
       if (schema) { sendData(ws, subId, schema, `${name}.schema`); sendDone(ws, subId); return }
       sendError(ws, subId, `Unknown namespace: ${ns}`); return
     }
@@ -108,7 +120,8 @@ export function serve(
     // Hash introspection: {ns}.hash
     if (innerMethod.endsWith('.hash')) {
       const ns = innerMethod.slice(0, -5)
-      const schema = schemas.get(ns)
+      // Try both the requested namespace and with backend prefix
+      const schema = schemas.get(ns) ?? schemas.get(`${name}.${ns}`)
       if (schema) { sendData(ws, subId, { event: 'hash', value: schema.hash }, `${name}.hash`); sendDone(ws, subId); return }
       sendError(ws, subId, `Unknown namespace: ${ns}`); return
     }
@@ -122,7 +135,8 @@ export function serve(
     }
 
     // Method call
-    const methodDef = methods.get(innerMethod)
+    // Try both the requested method and with backend prefix
+    const methodDef = methods.get(innerMethod) ?? methods.get(`${name}.${innerMethod}`)
     if (!methodDef) { sendError(ws, subId, `Method not found: ${innerMethod}`); return }
 
     // Apply TypeBox defaults then validate
@@ -209,13 +223,11 @@ export function serve(
 
         if (d.role !== 'client') return
 
-        // Direct _info (no subscription)
+        // _info — subscription pattern (like all other methods)
         if (msg.method === '_info') {
-          const rootSchema = schemas.get(name)
-          ws.send(JSON.stringify({
-            jsonrpc: '2.0', id: msg.id,
-            result: { backend: name, version: rootSchema?.version ?? '0.1.0' },
-          }))
+          const subId = nextSubId++
+          ws.send(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: subId }))
+          void handleInner(ws, subId, '_info', {})
           return
         }
 

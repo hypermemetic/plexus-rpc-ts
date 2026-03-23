@@ -5,14 +5,14 @@
 
 export interface StreamMetadata {
   provenance: string[]
-  plexusHash: string
+  plexus_hash: string
   timestamp: number
 }
 
 export interface PlexusStreamItemData {
   type: 'data'
   metadata: StreamMetadata
-  contentType: string
+  content_type: string
   content: unknown
 }
 
