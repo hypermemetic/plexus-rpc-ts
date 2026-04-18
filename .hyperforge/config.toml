@@ -1,6 +1,3 @@
 org = "hypermemetic"
-forges = [
-    "codeberg",
-    "github",
-]
+forges = ["github"]
 visibility = "public"
